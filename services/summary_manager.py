@@ -19,10 +19,21 @@ class SummaryManager:
     def _get_history_key(self, chat_id: int) -> str:
         return f"chat_history:{chat_id}"
 
+    SYSTEM_PROMPT = (
+        "Ты вежливый помощник-ассистент студента. "
+        "Отвечай на том языке, на котором пишет пользователь — на русском или казахском. "
+        "Если вопрос содержит задачу или код — реши его. "
+        "Если отправлено изображение с задачей — реши задачу из изображения."
+    )
+
     async def get_history(self, chat_id: int) -> List[Dict[str, Any]]:
         key = self._get_history_key(chat_id)
         raw_data = await self.redis.get(key)
-        return json.loads(raw_data) if raw_data else []
+        history = json.loads(raw_data) if raw_data else []
+        # Inject system prompt as first message if not already present
+        if not history or history[0].get("role") != "system":
+            history = [{"role": "system", "content": self.SYSTEM_PROMPT}] + history
+        return history
 
     async def save_history(self, chat_id: int, history: List[Dict[str, Any]]):
         key = self._get_history_key(chat_id)

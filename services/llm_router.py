@@ -13,7 +13,7 @@ class LLMRouter:
             
             active_model = self.default_model
             if total_content_len > 15000:
-                active_model = "llama-3.3-70b-specdec"
+                active_model = "llama-3.3-70b-versatile"
 
             kwargs = {
                 "model": active_model,
