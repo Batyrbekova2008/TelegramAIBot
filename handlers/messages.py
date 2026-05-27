@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import base64
 import tempfile
 import logging
@@ -15,8 +16,14 @@ from services.tools import AI_TOOLS, FUNCTIONS_MAP
 from services.tts_service import text_to_speech
 from services.rate_limiter import rate_limiter
 
+from services.search_service import SearchService, SearchAwareHandler
+
 router = Router()
 groq_client = AsyncGroq(api_key=config.GROQ_API_KEY.get_secret_value())
+action_logger = logging.getLogger("bot.actions")
+
+_search_svc = SearchService(api_key=config.TAVILY_API_KEY or None)
+_search_handler = SearchAwareHandler(groq_client, _search_svc)
 
 # ─── /start ────────────────────────────────────────────────────────────────────
 
@@ -25,6 +32,23 @@ async def handle_start(message: types.Message):
     await message.answer(
         "👋 <b>Сәлем! Мен AI көмекшіңізбін.</b>\n\n"
         "Мәтін, дауыстық хабарлама немесе суret жіберіңіз!",
+        parse_mode="HTML"
+    )
+
+# ─── /help ─────────────────────────────────────────────────────────────────────
+
+@router.message(Command("help"))
+async def handle_help(message: types.Message):
+    await message.answer(
+        "🤖 <b>Қолжетімді командалар:</b>\n\n"
+        "/start — Ботты қосу\n"
+        "/help — Осы анықтама\n\n"
+        "<b>Не жіберуге болады:</b>\n"
+        "✉️ Мәтін — AI жауабы\n"
+        "🎙️ Дауыс — транскрипция + AI жауабы\n"
+        "🖼️ Сурет — визуалды талдау\n\n"
+        "<b>Ақылды функциялар:</b>\n"
+        "🕐 Уақыт · 🌤️ Ауа райы · 🧮 Калькулятор · 💻 Жүйе ресурстары",
         parse_mode="HTML"
     )
 
@@ -74,6 +98,10 @@ async def handle_photo(message: types.Message):
         await save_message(user_id, chat_id, "user", "image", prompt)
         await save_message(user_id, chat_id, "assistant", "image", ai_text)
 
+        action_logger.info(
+            "user_id=%s username=%s type=image response_len=%d",
+            user_id, message.from_user.username or "", len(ai_text)
+        )
         await message.answer(ai_text, parse_mode="HTML")
 
     except Exception as e:
@@ -131,6 +159,11 @@ async def handle_voice(message: types.Message):
         await summary_manager.add_message(chat_id, "assistant", ai_text)
         await save_message(user_id, chat_id, "assistant", "voice", ai_text)
 
+        action_logger.info(
+            "user_id=%s username=%s type=voice text=%r response_len=%d",
+            user_id, message.from_user.username or "", user_text[:100], len(ai_text)
+        )
+
         # Respond with voice
         try:
             tts_path = await text_to_speech(ai_text)
@@ -151,7 +184,9 @@ async def handle_voice(message: types.Message):
                 except Exception:
                     pass
 
-# ─── Text ──────────────────────────────────────────────────────────────────────
+# ─── Text (streaming with debounce) ───────────────────────────────────────────
+
+_STREAM_DEBOUNCE = 1.5  # seconds between Telegram edits
 
 @router.message()
 async def handle_text(message: types.Message):
@@ -168,24 +203,85 @@ async def handle_text(message: types.Message):
         await save_message(user_id, chat_id, "user", "text", message.text)
 
         history = await summary_manager.get_history(chat_id)
-        response, _ = await llm_router.send_chat_completion(messages=history, tools=AI_TOOLS)
-        msg = response.choices[0].message
 
-        if msg.tool_calls:
-            ai_text = await _process_tool_calls(msg, history)
+        sent_msg = await message.answer("⏳")
+        accumulated = ""
+        last_edit_time = time.monotonic()
+        tool_calls_raw = None
+
+        async for event_type, data, _model in llm_router.stream_chat_completion(
+            messages=history, tools=AI_TOOLS
+        ):
+            if event_type == "text":
+                accumulated += data
+                now = time.monotonic()
+                if now - last_edit_time >= _STREAM_DEBOUNCE and accumulated.strip():
+                    try:
+                        await sent_msg.edit_text(accumulated, parse_mode="HTML")
+                        last_edit_time = now
+                    except Exception:
+                        pass
+            elif event_type == "tool_calls":
+                tool_calls_raw = data
+            # "done" — final full_text already equals accumulated
+
+        if tool_calls_raw:
+            ai_text = await _process_tool_calls_raw(tool_calls_raw, history, sent_msg)
         else:
-            ai_text = msg.content
+            ai_text = accumulated
+            if ai_text.strip():
+                try:
+                    await sent_msg.edit_text(ai_text, parse_mode="HTML")
+                except Exception:
+                    pass
 
         await summary_manager.add_message(chat_id, "assistant", ai_text)
         await save_message(user_id, chat_id, "assistant", "text", ai_text)
 
-        await message.answer(ai_text, parse_mode="HTML")
+        action_logger.info(
+            "user_id=%s username=%s type=text text=%r response_len=%d",
+            user_id, message.from_user.username or "", message.text[:100], len(ai_text)
+        )
 
     except Exception as e:
         logging.error(f"Text error: {e}")
         await message.answer("❌ Қате кетті. Қайтадан байқап көріңіз.")
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _process_tool_calls_raw(tool_calls_raw: dict, history: list, sent_msg) -> str:
+    """Process tool calls assembled from streaming chunks."""
+    tc_list = [
+        {
+            "id": tc["id"],
+            "type": "function",
+            "function": {"name": tc["name"], "arguments": tc["args"]},
+        }
+        for _, tc in sorted(tool_calls_raw.items())
+    ]
+    history.append({"role": "assistant", "tool_calls": tc_list})
+
+    tool_results = []
+    for tc in tc_list:
+        fn = FUNCTIONS_MAP.get(tc["function"]["name"])
+        if fn:
+            args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+            result = await fn(**args)
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+    history.extend(tool_results)
+
+    final_response, _ = await llm_router.send_chat_completion(messages=history)
+    ai_text = final_response.choices[0].message.content
+    try:
+        await sent_msg.edit_text(ai_text, parse_mode="HTML")
+    except Exception:
+        pass
+    return ai_text
+
 
 async def _process_tool_calls(msg, history: list) -> str:
     tool_results = []

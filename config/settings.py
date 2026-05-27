@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
 
+    # Tavily search API (Task 19) — optional
+    TAVILY_API_KEY: str = ""
+
+    # Webhook mode (Task 22) — optional
+    WEBHOOK_HOST: str = ""
+    WEBHOOK_SECRET: str = "changeme-webhook-secret"
+    WEBHOOK_PORT: int = 8443
+
     # .env файлдарын қолдау және валидация параметрлері
     model_config = SettingsConfigDict(
         env_file=".env",
